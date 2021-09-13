@@ -1,0 +1,32 @@
+version: '2.4'
+
+volumes:
+  git-workspace:
+    driver: local
+  maven-download-workspace:
+    driver: local
+  maven-repo:
+    driver: local
+
+services:
+  git-clone:
+    image: darinpope/alpine-basictools:latest
+    container_name: git-clone
+    volumes:
+      - ./gitserver/id_training-pipeline-sample:/root/.ssh/id_rsa:ro
+      - git-workspace:/git
+      - maven-download-workspace:/root/downloads/maven
+      - maven-repo:/root/.m2
+    command: >
+      bash -c "git clone git@github.com:cloudbees/training-pipeline-sample.git && 
+               cd /root/downloads/maven && 
+               wget https://archive.apache.org/dist/maven/maven-3/3.5.4/binaries/apache-maven-3.5.4-bin.tar.gz &&
+               wget https://archive.apache.org/dist/maven/binaries/apache-maven-2.2.1-bin.tar.gz &&
+               mkdir -p /root/tools &&
+               cp /root/downloads/maven/apache-maven-3.5.4-bin.tar.gz /root/tools/apache-maven-3.5.4-bin.tar.gz &&
+               cd /root/tools &&
+               tar zxvf apache-maven-3.5.4-bin.tar.gz &&
+               /root/tools/apache-maven-3.5.4/bin/mvn -f /git/training-pipeline-sample clean install &&
+               chown -R 1000:1000 /root/downloads/maven &&
+               chown -R 1000:1000 /root/.m2 &&
+               ls -l /root/downloads/maven"

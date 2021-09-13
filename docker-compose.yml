@@ -1,0 +1,211 @@
+version: '2.4'
+
+volumes:
+  webide-workspace:
+    driver: local
+  shared-backups:
+    driver: local
+  restore-home:
+    driver: local
+  docker-cache-dir:
+    driver: local
+  git-workspace:
+    driver: local
+  maven-download-workspace:
+    driver: local
+  maven-repo:
+    driver: local
+      
+services:
+  gitserver:
+    image: cloudbees/training-gitserver:master-b8c2e2dd2abc7edf474f2e75aa95d28f0154bd65@sha256:889c97cc5f99e4e9e3b75093982482cdc598d3f82ae8f40c8421bbd88da37503
+    container_name: gitserver
+    restart: unless-stopped
+    expose:
+      - "3000" # HTTP
+      - "5022" # SSH
+    volumes:
+      - /app/data
+      - ./gitserver/repositories.json:/tmp/repositories.json:ro
+      - ./gitserver/id_training-pipeline-sample:/tmp/id_training-pipeline-sample
+      - git-workspace:/tmp/git-workspace
+    environment:
+      - EXTERNAL_URL=http://${EXTERNAL_DOMAIN}:${EXTERNAL_PORT}/gitserver
+      - EXTERNAL_DOMAIN=${EXTERNAL_DOMAIN}
+      - FIRST_USER=${DEV_USER}
+      - LOAD_SSH_KEY_FROM_JENKINS=true # Autoload the BlueOcean SSH Key into Gitea
+      - SOURCE_REPO_CONFIG=/tmp/repositories.json
+    healthcheck:
+      test: curl --user butler:butler -sS http://localhost:3000/ | grep " Gitea Version" || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    depends_on:
+      gitserver-db:
+        condition: service_healthy
+
+  gitserver-db:
+    image: postgres:10-alpine
+    container_name: gitserver-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=gitea
+      - POSTGRES_PASSWORD=gitea
+      - POSTGRES_DB=gitea
+    healthcheck:
+      test: pg_isready -U gitea && psql -U gitea -lqt | cut -d \| -f 1 | grep -qw gitea || exit 1
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 60s
+
+  ldap-service:
+    image: dinkel/openldap:latest
+    restart: unless-stopped
+    container_name: ldap-service
+    ports:
+    - "389:389"
+    volumes:
+    - ./ldap-service/ldap-data:/etc/ldap.dist/prepopulate
+    environment:
+    - SLAPD_PASSWORD=JenkinsBestAutomationServer
+    - SLAPD_DOMAIN=ldap.cloudbees.training.local
+
+  front:
+    image: cloudbees/training-web:master-b8c2e2dd2abc7edf474f2e75aa95d28f0154bd65@sha256:dec5b849314cfc18a68a5e6ca512f60bf8d14e8d875ce44a4e4ed9d895419a15
+    restart: unless-stopped
+    container_name: front
+    read_only: true
+    environment:
+      - EXTERNAL_DOMAIN=${EXTERNAL_DOMAIN}
+      - EXTERNAL_PORT=${EXTERNAL_PORT}
+      - DOCS_HOSTNAME=${DOCS_HOSTNAME}
+      - DOCS_PATH=${DOCS_PATH}
+      - USE_LOCATIONS_FROM_LIBRARY=gitserver;devbox;webide;jenkins
+    ports:
+      - "${EXTERNAL_PORT}:${EXTERNAL_PORT}" # Publish to external world
+    volumes:
+      - ./front/chucknorris.hpi:/usr/share/nginx/html/chucknorris.hpi
+      - ./front/pub_key.txt:/usr/share/nginx/html/pub_key.txt
+      - ./front/service-list.html:/usr/share/nginx/html/service-list.html:ro
+      - ./front/docs-service-list.html:/usr/share/nginx/html/docs-service-list.html:ro
+      - /var/tmp/nginx
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    depends_on:
+      webide:
+        condition: service_started
+      jenkins:
+        condition: service_started
+      gitserver:
+        condition: service_started
+      devbox:
+        condition: service_started
+
+  devbox:
+    restart: unless-stopped
+    image: cloudbees/training-devbox:master-b8c2e2dd2abc7edf474f2e75aa95d28f0154bd65@sha256:692395c381f8c2dcc1a0e7f01fcab44b6db06578a9007c7d108880675451de29
+    container_name: devbox
+    privileged: true
+    volumes:
+      - webide-workspace:/workspace
+    environment:
+    - START_DOCKER=no
+    - DOCKER_HOST=tcp://docker-service:2375
+    - EXTERNAL_DOMAIN=${EXTERNAL_DOMAIN}
+    - EXTERNAL_PORT=${EXTERNAL_PORT}
+    extra_hosts:
+    - "${EXTERNAL_DOMAIN}:${DOCKER_BRIDGE_IP}"
+
+  docker-service:
+    image: verb/socat:alpine
+    restart: unless-stopped
+    command: tcp-listen:2375,reuseaddr,fork unix:/docker.sock
+    expose:
+      - "2375"
+    volumes:
+      - /var/run/docker.sock:/docker.sock
+
+  jenkins:
+    # Jenkins LTS (Long-Term Support) 2.222.1
+    image: cloudbees/training-jenkins:lts-master-b8c2e2dd2abc7edf474f2e75aa95d28f0154bd65
+    container_name: jenkins
+    restart: unless-stopped
+    expose:
+      - "8080" # HTTP
+      - "50000" # JNLP
+    volumes:
+      - ./jenkins/10-configure-agents.groovy:/usr/share/jenkins/ref/init.groovy.d/10-configure-agents.groovy
+      - ./jenkins/11-configure-master.groovy:/usr/share/jenkins/ref/init.groovy.d/11-configure-master.groovy
+      - maven-download-workspace:/tmp
+    depends_on:
+      jdk8-ssh-agent:
+        condition: service_started
+      jdk7-ssh-agent:
+        condition: service_started
+      gitserver:
+        condition: service_healthy
+    extra_hosts:
+      - "${EXTERNAL_DOMAIN}:${DOCKER_BRIDGE_IP}"
+    environment:
+      - JENKINS_EXTERNAL_URL=http://${EXTERNAL_DOMAIN}:${EXTERNAL_PORT}/jenkins
+      - JENKINS_OPTS=--prefix=/jenkins
+    healthcheck:
+      test: curl --user butler:butler -sS http://localhost:8080/jenkins/ | grep "Jenkins ver. 2.222.1" || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+  jdk8-ssh-agent:
+    image: cloudbees/training-jenkins-agent:jdk8-master-b8c2e2dd2abc7edf474f2e75aa95d28f0154bd65@sha256:100a62e1352331006c0a05ff835126bf2be376a845664f645fa6b150dec71979
+    container_name: jdk8-ssh-agent
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - maven-download-workspace:/tmp
+      - maven-repo:/home/jenkins/.m2
+    expose:
+      - "22" # SSH
+    extra_hosts:
+      - "${EXTERNAL_DOMAIN}:${DOCKER_BRIDGE_IP}"
+    environment:
+      - START_DOCKER=yes
+      - JENKINS_SLAVE_SSH_PUBKEY=ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEA6NF8iallvQVp22WDkTkyrtvp9eWW6A8YVr+kz4TjGYe7gHzIw+niNltGEFHzD8+v1I2YJ6oXevct1YeS0o9HZyN1Q9qgCgzUFtdOKLv6IedplqoPkcmF0aYet2PkEDo3MlTBckFXPITAMzF8dJSIFo9D8HfdOV0IAdx4O7PtixWKn5y2hMNG0zQPyUecp4pzC6kivAIhyfHilFR61RGL+GPXQ2MWZWFYbAGjyiYJnAmCP3NOTd0jMZEnDkbUvxhMmBYSdETk1rRgm+R4LOzFUGaHqHDLKLX+FIPKcF96hrucXzcWyLbIbEgE98OHlnVYCzRdK8jlqm8tehUc9c9WhQ== vagrant insecure public key
+
+  jdk7-ssh-agent:
+    container_name: jdk7-ssh-agent
+    image: cloudbees/training-jenkins-agent:jdk7-master-b8c2e2dd2abc7edf474f2e75aa95d28f0154bd65@sha256:c187eec925cec687ab7c7e3eb6479dfb96b7c9475dc4fc7d6f4dcee6fb02d959
+    restart: unless-stopped
+    volumes:
+      - maven-download-workspace:/tmp
+      - maven-repo:/home/jenkins/.m2
+    expose:
+      - "22" # SSH
+    extra_hosts:
+      - "${EXTERNAL_DOMAIN}:${DOCKER_BRIDGE_IP}"
+    environment:
+      - START_DOCKER=no
+      - JENKINS_SLAVE_SSH_PUBKEY=ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEA6NF8iallvQVp22WDkTkyrtvp9eWW6A8YVr+kz4TjGYe7gHzIw+niNltGEFHzD8+v1I2YJ6oXevct1YeS0o9HZyN1Q9qgCgzUFtdOKLv6IedplqoPkcmF0aYet2PkEDo3MlTBckFXPITAMzF8dJSIFo9D8HfdOV0IAdx4O7PtixWKn5y2hMNG0zQPyUecp4pzC6kivAIhyfHilFR61RGL+GPXQ2MWZWFYbAGjyiYJnAmCP3NOTd0jMZEnDkbUvxhMmBYSdETk1rRgm+R4LOzFUGaHqHDLKLX+FIPKcF96hrucXzcWyLbIbEgE98OHlnVYCzRdK8jlqm8tehUc9c9WhQ== vagrant insecure public key
+
+  webide:
+    image: cloudbees/training-webide@sha256:2e0127728660e72402d9694ed06766f14154c4711d34063c2bb173b599faed5e
+    restart: unless-stopped
+    container_name: webide
+    extra_hosts:
+      - "${EXTERNAL_DOMAIN}:${DOCKER_BRIDGE_IP}"
+    volumes:
+      - webide-workspace:/code/workspace
+
+  data-volume:
+    image: alpine:3.7
+    read_only: true
+    user: root
+    entrypoint: |
+      sh -c "chown -R ${DEV_USER_UID}:${DEV_GROUP_GID} /backups /workspace /restore-home"
+    volumes:
+      - webide-workspace:/workspace
+      - shared-backups:/backups
+      - restore-home:/restore-home
